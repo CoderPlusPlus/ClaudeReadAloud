@@ -323,3 +323,281 @@ def test_speech_asks_for_untrimmed_audio_and_ends_with_silence(close_later):
     assert trims == [False]
     assert not players.made[0].audio[-1].any()
 
+
+
+def test_a_paused_speech_starts_again_from_the_sentence_it_was_in(close_later):
+    speaker, players, synthesizer = make_speaker(holds=True)
+    close_later(speaker)
+    job = speaker.speak("One. Two. Three.", owner="a")
+    assert players.playing()
+    players.made[0].heard_piece = 1
+    speaker.pause("a")
+    assert players.made[0].is_closed
+    assert speaker.is_paused("a")
+    assert not speaker.is_speaking()
+    assert speaker.wait(job, 0.2)["result"] == "waiting"
+    speaker.resume("a")
+    assert players.playing(2)
+    assert synthesizer.spoken == ["One.", "Two.", "Three.", "Two.", "Three."]
+    assert players.made[1].pieces[0] == 1
+    players.made[1].close()
+    assert speaker.wait(job)["result"] == "finished"
+
+
+def test_a_speech_paused_before_any_sound_starts_from_the_beginning(close_later):
+    speaker, players, synthesizer = make_speaker(holds=True)
+    close_later(speaker)
+    job = speaker.speak("One. Two.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    speaker.resume("a")
+    assert players.playing(2)
+    assert players.made[1].pieces[0] == 0
+    players.made[1].close()
+    assert speaker.wait(job)["result"] == "finished"
+
+
+def test_other_owners_play_while_one_is_paused_and_do_not_cut_it_off(close_later):
+    speaker, players, synthesizer = make_speaker(holds=True)
+    close_later(speaker)
+    paused = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    other = speaker.speak("Theirs.", owner="b", after_own=True)
+    assert players.playing(2)
+    players.made[1].close()
+    assert speaker.wait(other)["result"] == "finished"
+    latest = speaker.speak("Again.", owner="c")
+    assert players.playing(3)
+    players.made[2].close()
+    assert speaker.wait(latest)["result"] == "finished"
+    assert speaker.wait(paused, 0.1)["result"] == "waiting"
+    speaker.resume("a")
+    assert players.playing(4)
+    players.made[3].close()
+    assert speaker.wait(paused)["result"] == "finished"
+
+
+def test_queued_speech_does_not_wait_for_a_paused_owner(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    paused = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    queued = speaker.speak("Announcement.", owner="b", queue=True)
+    speaker.pause("a")
+    assert players.playing(2)
+    players.made[1].close()
+    assert speaker.wait(queued)["result"] == "finished"
+    assert speaker.wait(paused, 0.1)["result"] == "waiting"
+
+
+def test_an_owners_later_speech_waits_behind_its_paused_speech(close_later):
+    speaker, players, synthesizer = make_speaker(holds=True)
+    close_later(speaker)
+    first = speaker.speak("First.", owner="a")
+    assert players.playing()
+    second = speaker.speak("Second.", owner="a", after_own=True)
+    speaker.pause("a")
+    assert speaker.wait(second, 0.2)["result"] == "waiting"
+    assert synthesizer.spoken == ["First."]
+    speaker.resume("a")
+    assert players.playing(2)
+    players.made[1].close()
+    assert speaker.wait(first)["result"] == "finished"
+    assert players.playing(3)
+    assert synthesizer.spoken == ["First.", "First.", "Second."]
+    players.made[2].close()
+    assert speaker.wait(second)["result"] == "finished"
+
+
+def test_resuming_cuts_off_another_owners_speech(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    paused = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    other = speaker.speak("Theirs.", owner="b", after_own=True)
+    assert players.playing(2)
+    speaker.resume("a")
+    assert speaker.wait(other)["result"] == "stopped"
+    assert players.playing(3)
+    players.made[2].close()
+    assert speaker.wait(paused)["result"] == "finished"
+
+
+def test_speech_sent_as_paused_waits_and_does_not_cut_off_others(close_later):
+    speaker, players, synthesizer = make_speaker(holds=True)
+    close_later(speaker)
+    other = speaker.speak("Theirs.", owner="b")
+    assert players.playing()
+    job = speaker.speak("Later.", owner="a", after_own=True, paused=True)
+    assert speaker.is_paused("a")
+    assert speaker.wait(job, 0.2)["result"] == "waiting"
+    assert speaker.wait(other, 0.1)["result"] == "waiting"
+    assert synthesizer.spoken == ["Theirs."]
+    speaker.resume("a")
+    assert speaker.wait(other)["result"] == "stopped"
+    assert players.playing(2)
+    players.made[1].close()
+    assert speaker.wait(job)["result"] == "finished"
+
+
+def test_speech_sent_as_not_paused_ends_a_stale_pause(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    first = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    second = speaker.speak("Next.", owner="a", after_own=True, paused=False)
+    assert not speaker.is_paused("a")
+    assert players.playing(2)
+    players.made[1].close()
+    assert speaker.wait(first)["result"] == "finished"
+    assert players.playing(3)
+    players.made[2].close()
+    assert speaker.wait(second)["result"] == "finished"
+
+
+def test_pausing_an_owner_with_nothing_playing_changes_nothing(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    speaker.pause("a")
+    assert not speaker.is_paused("a")
+    job = speaker.speak("Now.", owner="a", after_own=True)
+    assert players.playing()
+    players.made[0].close()
+    assert speaker.wait(job)["result"] == "finished"
+
+
+def test_a_pause_ends_when_the_owners_last_speech_is_stopped_by_job(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    job = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    speaker.stop(job=job)
+    assert speaker.wait(job)["result"] == "stopped"
+    assert not speaker.is_paused("a")
+
+
+def test_stopping_a_paused_owner_ends_its_speech_and_its_pause(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    job = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    speaker.stop("a")
+    assert speaker.wait(job)["result"] == "stopped"
+    assert not speaker.is_paused("a")
+    later = speaker.speak("Next.", owner="a", after_own=True)
+    assert players.playing(2)
+    players.made[1].close()
+    assert speaker.wait(later)["result"] == "finished"
+
+
+def test_new_speech_that_replaces_ends_its_owners_pause(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    job = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    again = speaker.speak("Again.", owner="a")
+    assert speaker.wait(job)["result"] == "stopped"
+    assert not speaker.is_paused("a")
+    assert players.playing(2)
+    players.made[1].close()
+    assert speaker.wait(again)["result"] == "finished"
+
+
+def test_replacing_speech_sent_as_paused_stays_paused_and_does_not_play_over_others(close_later):
+    speaker, players, synthesizer = make_speaker(holds=True)
+    close_later(speaker)
+    old = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    other = speaker.speak("Theirs.", owner="b", after_own=True)
+    assert players.playing(2)
+    again = speaker.speak("Again.", owner="a", paused=True)
+    assert speaker.wait(old)["result"] == "stopped"
+    assert speaker.is_paused("a")
+    assert speaker.wait(again, 0.2)["result"] == "waiting"
+    assert speaker.wait(other, 0.1)["result"] == "waiting"
+    assert synthesizer.spoken == ["Mine.", "Theirs."]
+    speaker.resume("a")
+    assert speaker.wait(other)["result"] == "stopped"
+    assert players.playing(3)
+    players.made[2].close()
+    assert speaker.wait(again)["result"] == "finished"
+
+
+def test_queued_speech_sent_as_not_paused_cuts_off_others_before_the_old_speech_plays(close_later):
+    speaker, players, synthesizer = make_speaker(holds=True)
+    close_later(speaker)
+    old = speaker.speak("Mine.", owner="a")
+    assert players.playing()
+    speaker.pause("a")
+    other = speaker.speak("Theirs.", owner="b", after_own=True)
+    assert players.playing(2)
+    queued = speaker.speak("Next.", owner="a", queue=True, paused=False)
+    assert speaker.wait(other)["result"] == "stopped"
+    assert not speaker.is_paused("a")
+    assert players.playing(3)
+    assert synthesizer.spoken == ["Mine.", "Theirs.", "Mine."]
+    players.made[2].close()
+    assert speaker.wait(old)["result"] == "finished"
+    assert players.playing(4)
+    players.made[3].close()
+    assert speaker.wait(queued)["result"] == "finished"
+
+
+def test_resuming_an_owner_that_is_not_paused_changes_nothing(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    job = speaker.speak("Theirs.", owner="b")
+    assert players.playing()
+    speaker.resume("a")
+    assert speaker.is_speaking()
+    players.made[0].close()
+    assert speaker.wait(job)["result"] == "finished"
+
+
+class _FakeStream:
+    latency = 1.0
+
+    def __init__(self, samplerate, channels, dtype, callback, finished_callback):
+        self.callback = callback
+
+    def start(self):
+        pass
+
+    def abort(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_the_sentence_heard_follows_the_sound_card_not_the_hand_off(monkeypatch):
+    import sys
+    import types
+
+    from claudevoice.engine import SoundDevicePlayer
+
+    monkeypatch.setitem(
+        sys.modules, "sounddevice", types.SimpleNamespace(OutputStream=_FakeStream, CallbackStop=RuntimeError)
+    )
+    player = SoundDevicePlayer(10)
+    ones = lambda n: np.ones(n, dtype=np.float32)
+    player.add(ones(10), 0)
+    player.add(np.zeros(10, dtype=np.float32), 0)
+    player.add(ones(10), 1)
+    out = np.zeros((10, 1), dtype=np.float32)
+    assert player.heard() is None
+    player._fill(out, 10, None, None)
+    assert player.heard() is None
+    player._fill(out, 10, None, None)
+    assert player.heard() == 0
+    player._fill(out, 10, None, None)
+    assert player.heard() == 0
+    player._fill(out, 10, None, None)
+    assert player.heard() == 1

@@ -24,6 +24,8 @@ class FakeSynthesizer:
 class FakePlayer:
     def __init__(self, holds: bool):
         self.audio: list[np.ndarray] = []
+        self.pieces: list[int] = []
+        self.heard_piece: int | None = None
         self.is_finished = False
         self.is_closed = False
         self.started_waiting = threading.Event()
@@ -31,8 +33,12 @@ class FakePlayer:
         if not holds:
             self._released.set()
 
-    def add(self, audio):
+    def add(self, audio, piece):
         self.audio.append(audio)
+        self.pieces.append(piece)
+
+    def heard(self):
+        return self.heard_piece
 
     def finish(self):
         self.is_finished = True

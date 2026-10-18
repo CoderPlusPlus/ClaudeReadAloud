@@ -50,7 +50,7 @@ function wrapped(text: string, kind: 'reply' | 'thinking', number?: number) {
   return `<${opening}>\n${text.replace(/<\/(reply|thinking)/gi, '< /$1')}\n</${kind}>`
 }
 
-type Outcome = { result: 'finished' | 'stopped' | 'nothing' | 'unknown' | 'error'; error?: string }
+type Outcome = { result: 'finished' | 'stopped' | 'nothing' | 'unknown' | 'error' | 'waiting'; error?: string }
 
 function joinPath($: EngineInterface, ...parts: string[]) {
   const separator = $.plugin.root.includes('\\') ? '\\' : '/'
@@ -164,7 +164,7 @@ type SpeechRecord = {
   reason?: string
 }
 
-type SpeakOptions = { voice: string; owner: string; queue?: boolean; after_own?: boolean; record: SpeechRecord }
+type SpeakOptions = { voice: string; owner: string; queue?: boolean; after_own?: boolean; paused?: boolean; record: SpeechRecord }
 
 async function send($: EngineInterface, base: string, text: string, options: SpeakOptions) {
   const answer = await call($, `${base}/speak`, 'POST', { text, ...options })
@@ -176,7 +176,9 @@ async function outcome($: EngineInterface, base: string, id: number): Promise<Ou
   let failures = 0
   for (;;) {
     try {
-      return (await call($, `${base}/wait?job=${id}`, 'GET')) as Outcome
+      const answer = (await call($, `${base}/wait?job=${id}`, 'GET')) as Outcome
+      if (answer.result !== 'waiting') return answer
+      failures = 0
     } catch (error) {
       failures += 1
       if (failures >= WAIT_RETRIES || !(await isRunning($, base))) {
@@ -327,11 +329,12 @@ async function sendOwned(
   mode: SendMode,
   isCurrent: () => Promise<boolean>,
   record: SpeechRecord,
+  isPaused?: () => boolean,
 ) {
   return exclusive(owner, async () => {
     if (!(await isCurrent())) return undefined
     const how = mode === 'queue' ? { queue: true } : mode === 'afterOwn' ? { after_own: true } : {}
-    const options = { voice: await chosenVoice($), owner, ...how, record }
+    const options = { voice: await chosenVoice($), owner, ...how, ...(isPaused ? { paused: isPaused() } : {}), record }
     const attempt = async () => {
       if (mode === 'queue') await call($, `${base}/stop`, 'POST', { owner })
       return send($, base, text, options)
@@ -370,7 +373,7 @@ type Entry = {
 }
 
 // `at` is the reply being spoken (the n of "Message n of m"); `sendAt` is the next one to hand to the speaker, which can run ahead of `at`.
-type Line = { entries: Entry[]; at: number; sendAt: number; isSending: boolean; isAgain: boolean; isHeld: boolean; ticket?: number }
+type Line = { entries: Entry[]; at: number; sendAt: number; isSending: boolean; isAgain: boolean; isHeld: boolean; isPaused: boolean; ticket?: number }
 
 const lines = new Map<string, Line>()
 const running = new Set<string>()
@@ -379,6 +382,7 @@ function statusOf(owner: string): Status {
   const line = lines.get(owner)
   const entry = line?.entries[line.at]
   if (!line || !entry) return 'idle'
+  if (line.isPaused) return 'paused'
   if (entry.job !== undefined) return 'speaking'
   if (line.isHeld) return 'waiting'
   return entry.spoken ? 'starting' : 'summarizing'
@@ -475,7 +479,7 @@ async function deliver($: EngineInterface, owner: string, line: Line, entry: Ent
     await refresh($, owner)
     if (entry.mode !== 'replace' && !(await isViewed($))) {
       line.isHeld = true
-      if (!running.has(owner)) announceOnce($, owner, line, entry.setup)
+      if (!running.has(owner) && !line.isPaused) announceOnce($, owner, line, entry.setup)
       await refresh($, owner)
       if (!(await isViewed($))) return false
       line.isHeld = false
@@ -485,7 +489,7 @@ async function deliver($: EngineInterface, owner: string, line: Line, entry: Ent
     retireAnnouncement(owner)
     entry.base = await entry.setup
     const record = await recordOf($, owner, entry, spoken)
-    const id = await sendOwned($, entry.base, owner, spoken.text, entry.mode, isCurrent, record)
+    const id = await sendOwned($, entry.base, owner, spoken.text, entry.mode, isCurrent, record, () => line.isPaused)
     if (id !== undefined) entry.job = id
   } catch (error) {
     if (await isCurrent()) $.ui.toast(`Could not read aloud: ${messageOf(error)}`)
@@ -538,7 +542,7 @@ async function follow($: EngineInterface, owner: string, line: Line) {
 async function enqueue($: EngineInterface, text: string, mode: SendMode, kind: Entry['kind'], blocks: Block[], heard: 'reply' | 'thinking') {
   const owner = await $.session.id()
   const found = lines.get(owner)
-  const line: Line = found ?? { entries: [], at: 0, sendAt: 0, isSending: false, isAgain: false, isHeld: false }
+  const line: Line = found ?? { entries: [], at: 0, sendAt: 0, isSending: false, isAgain: false, isHeld: false, isPaused: false }
   if (!found) lines.set(owner, line)
   const entry = makeEntry($, text, mode, kind, blocks, heard)
   line.entries.push(entry)
@@ -604,7 +608,7 @@ function combineHeld($: EngineInterface, line: Line, wasHeld: boolean) {
 async function announceIfWaiting($: EngineInterface, owner: string) {
   const line = lines.get(owner)
   const waiting = line?.entries.slice(line.sendAt).find(entry => entry.mode !== 'replace' && !entry.isDropped && !entry.isSent)
-  if (line && waiting && !(await isViewed($))) announceOnce($, owner, line, waiting.setup)
+  if (line && waiting && !line.isPaused && !(await isViewed($))) announceOnce($, owner, line, waiting.setup)
 }
 
 async function addStep($: EngineInterface, turnId: string, blocks: Block[]) {
@@ -665,6 +669,24 @@ async function repeat($: EngineInterface) {
   }
 }
 
+async function setPaused($: EngineInterface, isPaused: boolean) {
+  const owner = await $.session.id()
+  const line = lines.get(owner)
+  if (!line) return
+  await exclusive(owner, async () => {
+    if (lines.get(owner) !== line || line.isPaused === isPaused) return
+    try {
+      const base = `http://127.0.0.1:${await port($)}`
+      await call($, `${base}/${isPaused ? 'pause' : 'resume'}`, 'POST', { owner })
+    } catch (error) {
+      $.ui.toast(`Could not ${isPaused ? 'pause' : 'resume'}: ${messageOf(error)}`)
+      return
+    }
+    line.isPaused = isPaused
+    await refresh($, owner)
+  })
+}
+
 async function toggleVoice($: EngineInterface) {
   const isOn = await update($, enabled, on => !on)
   if (!isOn) await silence($)
@@ -708,6 +730,7 @@ const STATUS_TEXT: Record<string, string> = {
   starting: 'Starting voice…',
   speaking: 'Speaking',
   waiting: 'Will speak when you open this session',
+  paused: 'Paused',
 }
 
 async function remember($: EngineInterface, name: unknown) {
@@ -811,15 +834,17 @@ export const register: Register = on => {
     const loaded = await read($, version)
     const { Box, Button, Select, Text } = $.ui.resolve(e)
     const canSkip = where !== null && where.current < where.total
+    const isBusy = current === 'summarizing' || current === 'starting' || current === 'speaking' || current === 'paused'
 
     const row = [
       <Button key="voice-toggle" label={isOn ? 'Voice: on' : 'Voice: off'} dimColor={!isOn} onPress={() => void toggleVoice($)} />,
       <Select key="voice-pick" options={VOICE_OPTIONS} value={picked} onSelect={value => void update($, voice, () => value)} />,
-      current === 'summarizing' || current === 'starting' || current === 'speaking' ? (
+      isBusy ? (
         <Button key="voice-repeat" label="Stop" onPress={() => void silence($)} />
       ) : (
         <Button key="voice-repeat" label="Repeat" dimColor onPress={() => void repeat($)} />
       ),
+      <Button key="voice-pause" label={current === 'paused' ? 'Resume' : 'Pause'} dimColor={!isBusy} onPress={() => void setPaused($, current !== 'paused')} />,
       <Button key="voice-skip" label="Skip" dimColor={!canSkip} onPress={() => void skip($)} />,
     ]
     if (where) row.push(<Text key="voice-place" dimColor>{`Message ${where.current} of ${where.total}`}</Text>)

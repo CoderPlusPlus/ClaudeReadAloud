@@ -1,4 +1,4 @@
-export type Status = 'idle' | 'summarizing' | 'starting' | 'speaking' | 'waiting'
+export type Status = 'idle' | 'summarizing' | 'starting' | 'speaking' | 'waiting' | 'paused'
 export type Summary = { source: string; text: string }
 export type Spoken = { text: string; how: 'haiku' | 'saved' | 'full-text' | 'runaway' | 'separate'; reason?: string; warning?: string }
 export type Place = { current: number; total: number }

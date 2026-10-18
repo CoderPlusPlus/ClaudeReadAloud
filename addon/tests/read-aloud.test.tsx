@@ -14,7 +14,7 @@ const STATUS_WAITING = 'Will speak when you open this session'
 const ANNOUNCEMENT = 'MyProject has finished and would like to speak.'
 const ANNOUNCER = 'session-1#announce'
 
-type Sent = { text: string; voice: string; owner: string; queue?: boolean; after_own?: boolean }
+type Sent = { text: string; voice: string; owner: string; queue?: boolean; after_own?: boolean; paused?: boolean }
 
 type Job = { id: number; text: string; owner: string; result?: string; error?: string; waiters: (() => void)[] }
 
@@ -33,6 +33,9 @@ type Speaker = {
   speakAs: (owner: string, text: string) => void
   speechError?: string
   stopBodies: Record<string, unknown>[]
+  pauseCalls: string[]
+  pauseFails: boolean
+  waitingAnswers: number
   holdSends: number
   releaseSends: () => void
   toasts: string[]
@@ -67,7 +70,7 @@ function emptyBand(on: On) {
   })
 }
 
-// Models the speaker's /speak, /stop and /wait: one job plays at a time, the rest wait in line. A job finishes at once unless `holds` keeps it playing until `end`.
+// Models the speaker's /speak, /stop, /wait, /pause and /resume: one job plays at a time, the rest wait in line, and a paused owner's jobs wait at the front. A job finishes at once unless `holds` keeps it playing until `end`.
 function fakeSpeaker(on: On): Speaker {
   emptyBand(on)
   const clock = mock.clock(on)
@@ -75,6 +78,7 @@ function fakeSpeaker(on: On): Speaker {
   const notify = () => listeners.slice().forEach(listener => listener())
   const jobs = new Map<number, Job>()
   const line: Job[] = []
+  const paused = new Set<string>()
   let current: Job | undefined
 
   const close = (job: Job, result: string, error?: string) => {
@@ -84,8 +88,10 @@ function fakeSpeaker(on: On): Speaker {
     job.waiters.splice(0).forEach(wake => wake())
   }
   const playNext = () => {
-    while (!current && line.length > 0) {
-      const job = line.shift()!
+    for (;;) {
+      const next = current ? -1 : line.findIndex(job => !paused.has(job.owner))
+      if (next < 0) break
+      const job = line.splice(next, 1)[0]!
       current = job
       speaker.played.push(job.text)
       if (speaker.speechError !== undefined) {
@@ -113,7 +119,10 @@ function fakeSpeaker(on: On): Speaker {
   const enqueue = (body: Sent) => {
     const job: Job = { id: jobs.size + 1, text: body.text, owner: body.owner, waiters: [] }
     jobs.set(job.id, job)
-    if (!body.queue) cut(other => !body.after_own || other.owner !== body.owner)
+    if (body.paused === true) paused.add(body.owner)
+    else if (body.paused === false || (!body.queue && !body.after_own)) paused.delete(body.owner)
+    const isOwnerPaused = paused.has(body.owner)
+    if (!body.queue) cut(other => (other.owner === body.owner ? !body.after_own : !isOwnerPaused && !paused.has(other.owner)))
     line.push(job)
     playNext()
     return job
@@ -139,6 +148,9 @@ function fakeSpeaker(on: On): Speaker {
     },
     speakAs: (owner, text) => void enqueue({ text, voice: 'af_heart', owner }),
     stopBodies: [],
+    pauseCalls: [],
+    pauseFails: false,
+    waitingAnswers: 0,
     holdSends: 0,
     releaseSends: () => {},
     toasts: [],
@@ -224,12 +236,34 @@ function fakeSpeaker(on: On): Speaker {
     if (url.pathname === '/stop') {
       const body = JSON.parse(e.init?.body ?? '{}') as { owner?: string; job?: number }
       speaker.stopBodies.push(body)
+      if (body.job === undefined) paused.delete(body.owner ?? '')
       cut(job => (body.job !== undefined ? job.id === body.job : body.owner !== undefined ? job.owner === body.owner : true))
       return answer({ stopped: true })
+    }
+    if (url.pathname === '/pause' || url.pathname === '/resume') {
+      const { owner } = JSON.parse(e.init?.body ?? '{}') as { owner: string }
+      speaker.pauseCalls.push(`${url.pathname.slice(1)} ${owner}`)
+      if (speaker.pauseFails) return answer({ error: 'not found' }, 404)
+      if (url.pathname === '/pause') {
+        if (current?.owner === owner || line.some(job => job.owner === owner)) paused.add(owner)
+        if (current?.owner === owner) {
+          line.unshift(current)
+          current = undefined
+        }
+      } else if (paused.delete(owner) && line.some(job => job.owner === owner)) {
+        cut(job => job.owner !== owner && !paused.has(job.owner))
+      }
+      playNext()
+      return answer({ paused: paused.has(owner) })
     }
     if (url.pathname === '/wait') {
       const job = jobs.get(Number(url.searchParams.get('job')))
       if (!job) return answer({ result: 'unknown' })
+      if (job.result === undefined && speaker.waitingAnswers > 0) {
+        speaker.waitingAnswers -= 1
+        notify()
+        return answer({ job: job.id, result: 'waiting' })
+      }
       if (job.result === undefined) await new Promise<void>(resolve => job.waiters.push(resolve))
       return answer({ job: job.id, result: job.result, ...(job.error === undefined ? {} : { error: job.error }) })
     }
@@ -474,7 +508,7 @@ describe('with voice on and the session viewed', () => {
     expect(speaker.summaryRequests[0]!.system).toContain(
       "Do not say that this is a summary. If the reply is only a sentence or two, keep it about as long as the reply. If it is longer, use at most about a third of the reply's length, and never more than 120 words.",
     )
-    expect(speaker.sends[0]).toEqual({ text: 'Spoken: I changed `config.json`.', voice: 'af_heart', owner: 'session-1', after_own: true })
+    expect(speaker.sends[0]).toEqual({ text: 'Spoken: I changed `config.json`.', voice: 'af_heart', owner: 'session-1', after_own: true, paused: false })
     expect(speaker.ended).toEqual([{ text: 'Spoken: I changed `config.json`.', result: 'finished' }])
     await showsNoStatus(speaker, ui)
     await showsPlace(speaker, ui, undefined)
@@ -724,7 +758,7 @@ describe('reading blocks as they arrive', () => {
     await showsNoStatus(speaker, ui)
     await ui.press({ key: 'voice-repeat' })
     await speaker.until(() => speaker.sends.length === 3)
-    expect(speaker.sends[2]).toEqual({ text: 'Spoken: Second block.', voice: 'af_heart', owner: 'session-1' })
+    expect(speaker.sends[2]).toEqual({ text: 'Spoken: Second block.', voice: 'af_heart', owner: 'session-1', paused: false })
     expect(speaker.summaryRequests).toHaveLength(2)
     await ui.unmount()
   })
@@ -793,7 +827,7 @@ describe('reading blocks as they arrive', () => {
     await speaker.until(() => speaker.playing() === 'Spoken: One.')
     await step($, speaker, 'Two.')
     await speaker.until(() => speaker.sends.length === 2)
-    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Two.', voice: 'af_heart', owner: 'session-1', after_own: true })
+    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Two.', voice: 'af_heart', owner: 'session-1', after_own: true, paused: false })
     await $.turn.complete({ ...TURN, answer: 'Two.' })
     await speaker.settle()
     expect(speaker.sends.map(sent => sent.text)).toEqual(['Spoken: One.', 'Spoken: Two.'])
@@ -1029,7 +1063,7 @@ describe('with voice on and the session not viewed', () => {
     await $.session.attach(ATTACH)
     await speaker.until(() => speaker.sends.length === 4)
     expect(speaker.sends.slice(1)).toEqual(
-      ['One.', 'Two.', 'Three.'].map(text => ({ text: `Spoken: ${text}`, voice: 'af_heart', owner: 'session-1', after_own: true })),
+      ['One.', 'Two.', 'Three.'].map(text => ({ text: `Spoken: ${text}`, voice: 'af_heart', owner: 'session-1', after_own: true, paused: false })),
     )
     await showsStatus(speaker, ui, 'Speaking')
     speaker.end()
@@ -1090,7 +1124,7 @@ describe('with voice on and the session not viewed', () => {
     speaker.surfaces = ['desktop']
     await $.session.attach(ATTACH)
     await speaker.until(() => speaker.ended.length === 2)
-    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Hello.', voice: 'af_heart', owner: 'session-1', after_own: true })
+    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Hello.', voice: 'af_heart', owner: 'session-1', after_own: true, paused: false })
     expect(speaker.ended).toEqual([
       { text: ANNOUNCEMENT, result: 'stopped' },
       { text: 'Spoken: Hello.', result: 'finished' },
@@ -1149,7 +1183,7 @@ describe('with voice on and the session not viewed', () => {
     speaker.surfaces = ['desktop']
     await $.session.attach(ATTACH)
     await speaker.until(() => speaker.sends.length === 2)
-    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Hello.', voice: 'af_heart', owner: 'session-1', after_own: true })
+    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Hello.', voice: 'af_heart', owner: 'session-1', after_own: true, paused: false })
     await showsNoStatus(speaker, ui)
     expect(speaker.summaryRequests).toHaveLength(1)
 
@@ -1228,7 +1262,7 @@ describe('with voice on and the session not viewed', () => {
     expect(speaker.sends).toHaveLength(1)
     speaker.releaseSummaries()
     await speaker.until(() => speaker.sends.length === 2)
-    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Hello.', voice: 'af_heart', owner: 'session-1', after_own: true })
+    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Hello.', voice: 'af_heart', owner: 'session-1', after_own: true, paused: false })
     await ui.unmount()
   })
 
@@ -1622,7 +1656,7 @@ describe('repeat button', () => {
     void ui.press({ key: 'voice-repeat' })
     await speaker.until(() => speaker.sends.length === 2 && speaker.playing() === 'Spoken: Done.')
     expect(speaker.summaryRequests).toHaveLength(1)
-    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Done.', voice: 'af_heart', owner: 'session-1' })
+    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Done.', voice: 'af_heart', owner: 'session-1', paused: false })
     expect(speaker.ended.at(-1)).toEqual({ text: 'Other session.', result: 'stopped' })
     await showsPlace(speaker, ui, 'Message 1 of 1')
     speaker.end()
@@ -1676,7 +1710,7 @@ describe('repeat button', () => {
     await showsPlace(speaker, ui, 'Message 1 of 1')
     expect(speaker.summaryRequests).toHaveLength(2)
     expect(speaker.sends.map(sent => sent.text)).toEqual([ANNOUNCEMENT, 'Spoken: Two.'])
-    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Two.', voice: 'af_heart', owner: 'session-1' })
+    expect(speaker.sends[1]).toEqual({ text: 'Spoken: Two.', voice: 'af_heart', owner: 'session-1', paused: false })
     await $.session.attach(ATTACH)
     await speaker.settle()
     expect(speaker.sends).toHaveLength(2)
@@ -1832,7 +1866,7 @@ describe('catching up on a session with many held blocks', () => {
     expect(catchUp.system).toContain('catches the person up')
     expect(catchUp.system).toContain('a question that a later piece answers')
     for (const [i, text] of ['One?', 'Two.', 'Three.', 'Four.'].entries()) expect(catchUp.prompt).toContain(`<reply ${i + 1}>\n${text}\n</reply>`)
-    expect(speaker.sends[1]).toEqual({ text: `Spoken: ${catchUp.prompt.replace(/\n<\/reply>$/, '')}`, voice: 'af_heart', owner: 'session-1', after_own: true })
+    expect(speaker.sends[1]).toEqual({ text: `Spoken: ${catchUp.prompt.replace(/\n<\/reply>$/, '')}`, voice: 'af_heart', owner: 'session-1', after_own: true, paused: false })
     await showsPlace(speaker, ui, 'Message 1 of 1')
     speaker.end()
     await showsPlace(speaker, ui, undefined)
@@ -2177,5 +2211,180 @@ describe('what is sent with each speech for the spoken log', () => {
       summary: 'separate',
       reason: 'Claude answered with code 529',
     })
+  })
+})
+
+describe('pause and resume', () => {
+  test('Pause sets the session aside and Resume carries on, with the row showing which', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'Hello.')
+    await speaker.until(() => speaker.playing() === 'Spoken: Hello.')
+    await showsStatus(speaker, ui, 'Speaking')
+    expect(await ui.find({ key: 'voice-pause' })).toMatchObject({ props: { label: 'Pause', dimColor: false } })
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    expect(speaker.pauseCalls).toEqual(['pause session-1'])
+    expect(speaker.playing()).toBeUndefined()
+    await showsStatus(speaker, ui, 'Paused')
+    expect(await label(ui, 'voice-pause')).toBe('Resume')
+    expect(await label(ui, 'voice-repeat')).toBe('Stop')
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    expect(speaker.pauseCalls).toEqual(['pause session-1', 'resume session-1'])
+    expect(speaker.playing()).toBe('Spoken: Hello.')
+    await showsStatus(speaker, ui, 'Speaking')
+    expect(await label(ui, 'voice-pause')).toBe('Pause')
+    speaker.end()
+    await speaker.until(() => speaker.ended.length === 1)
+    await showsNoStatus(speaker, ui)
+    expect(speaker.toasts).toEqual([])
+    await ui.unmount()
+  })
+
+  test('Pause is dimmed and does nothing while the session has nothing to say', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    expect(await ui.find({ key: 'voice-pause' })).toMatchObject({ props: { label: 'Pause', dimColor: true } })
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    expect(speaker.pauseCalls).toEqual([])
+    await ui.unmount()
+  })
+
+  test('while paused, Skip moves to the next block and stays paused', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurns($, speaker, ['One.', 'Two.'])
+    await speaker.until(() => speaker.sends.length === 2)
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    await ui.press({ key: 'voice-skip' })
+    await speaker.until(() => speaker.ended.length === 1)
+    await showsPlace(speaker, ui, 'Message 2 of 2')
+    await showsStatus(speaker, ui, 'Paused')
+    expect(speaker.playing()).toBeUndefined()
+    await ui.press({ key: 'voice-pause' })
+    await speaker.until(() => speaker.playing() === 'Spoken: Two.')
+    await ui.unmount()
+  })
+
+  test('Stop while paused ends the pause along with the speech', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'Hello.')
+    await speaker.until(() => speaker.playing() === 'Spoken: Hello.')
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    await ui.press({ key: 'voice-repeat' })
+    await speaker.until(() => speaker.ended.length === 1)
+    await showsNoStatus(speaker, ui)
+    expect(await label(ui, 'voice-pause')).toBe('Pause')
+    await finishTurn($, speaker, 'Next.', 't2')
+    await speaker.until(() => speaker.playing() === 'Spoken: Next.')
+    await ui.unmount()
+  })
+
+  test('a paused session that is left does not announce itself when more blocks arrive', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'Hello.')
+    await speaker.until(() => speaker.playing() === 'Spoken: Hello.')
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    speaker.surfaces = []
+    await finishTurn($, speaker, 'More.', 't2')
+    await speaker.settle()
+    expect(speaker.spoken).not.toContain(ANNOUNCEMENT)
+    await ui.unmount()
+  })
+
+  test('every send says whether the session is paused', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'One.')
+    await speaker.until(() => speaker.playing() === 'Spoken: One.')
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    await finishTurn($, speaker, 'Two.', 't2')
+    await speaker.until(() => speaker.sends.length === 2)
+    expect(speaker.sends.map(sent => sent.paused)).toEqual([false, true])
+    expect(speaker.pauseCalls).toEqual(['pause session-1'])
+    expect(speaker.playing()).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('Resume pressed while a block is being sent is not undone by that block', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'One.')
+    await speaker.until(() => speaker.playing() === 'Spoken: One.')
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    speaker.holdSends = 1
+    await finishTurn($, speaker, 'Two.', 't2')
+    await speaker.until(() => speaker.sends.length === 2)
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    speaker.releaseSends()
+    await speaker.until(() => speaker.playing() === 'Spoken: One.')
+    await showsStatus(speaker, ui, 'Speaking')
+    expect(await label(ui, 'voice-pause')).toBe('Pause')
+    await ui.unmount()
+  })
+
+  test('when the speaker cannot pause, the row does not say Paused', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    speaker.pauseFails = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'Hello.')
+    await speaker.until(() => speaker.playing() === 'Spoken: Hello.')
+    await ui.press({ key: 'voice-pause' })
+    await speaker.settle()
+    expect(speaker.toasts.length).toBe(1)
+    await showsStatus(speaker, ui, 'Speaking')
+    expect(await label(ui, 'voice-pause')).toBe('Pause')
+    expect(speaker.playing()).toBe('Spoken: Hello.')
+    await ui.unmount()
+  })
+
+  test('a wait that comes back still waiting is asked again', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    speaker.waitingAnswers = 2
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'Hello.')
+    await speaker.until(() => speaker.playing() === 'Spoken: Hello.' && speaker.waitingAnswers === 0)
+    await showsStatus(speaker, ui, 'Speaking')
+    speaker.end()
+    await speaker.until(() => speaker.ended.length === 1)
+    await showsNoStatus(speaker, ui)
+    expect(speaker.toasts).toEqual([])
+    await ui.unmount()
   })
 })

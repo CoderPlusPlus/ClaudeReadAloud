@@ -13,6 +13,8 @@ MAX_BODY_BYTES = 2_000_000
 MAX_RECORD_BYTES = 8_000_000
 MAX_DRAIN_BYTES = 64_000_000
 LOAD_WAIT_SECONDS = 120
+# Kept under the time a client is likely to give up on one request; a paused job can wait far longer, so clients ask again.
+WAIT_HOLD_SECONDS = 30
 _HUGE = 10**18
 
 log = logging.getLogger(__name__)
@@ -119,7 +121,7 @@ class _Handler(BaseHTTPRequestHandler):
             if job is None:
                 self._send(400, {"error": "job must be a number"})
                 return
-            self._send(200, speaker.wait(job))
+            self._send(200, speaker.wait(job, WAIT_HOLD_SECONDS))
         else:
             self._send(404, {"error": "not found"})
 
@@ -148,6 +150,7 @@ class _Handler(BaseHTTPRequestHandler):
             queue = body.get("queue", False)
             after_own = body.get("after_own", False)
             record = body.get("record")
+            paused = body.get("paused")
             if not isinstance(text, str):
                 self._send(400, {"error": "text must be a string"})
             elif len(text.encode("utf-8")) > MAX_BODY_BYTES:
@@ -158,12 +161,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(400, {"error": "owner must be a string, and queue and after_own true or false"})
             elif after_own and (queue or not owner):
                 self._send(400, {"error": "after_own needs an owner and cannot be combined with queue"})
+            elif paused is not None and not isinstance(paused, bool):
+                self._send(400, {"error": "paused must be true or false"})
             elif "record" in body and not isinstance(record, dict):
                 self._send(400, {"error": "record must be a JSON object"})
             else:
                 if isinstance(record, dict) and len(json.dumps(record).encode("utf-8")) > MAX_RECORD_BYTES:
                     record = {"omitted": "the record was too large to keep"}
-                job = speaker.speak(text, voice=voice, owner=owner, queue=queue, after_own=after_own, record=record)
+                job = speaker.speak(text, voice=voice, owner=owner, queue=queue, after_own=after_own, record=record, paused=paused)
                 self._send(200, {"job": job})
         elif path == "/stop" and speaker is not None:
             body = self._read_json()
@@ -179,6 +184,19 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             speaker.stop(owner, job)
             self._send(200, {"stopped": True})
+        elif path in ("/pause", "/resume") and speaker is not None:
+            body = self._read_json()
+            if body is None:
+                return
+            owner = body.get("owner")
+            if not isinstance(owner, str) or not owner:
+                self._send(400, {"error": "owner must be a non-empty string"})
+                return
+            if path == "/pause":
+                speaker.pause(owner)
+            else:
+                speaker.resume(owner)
+            self._send(200, {"paused": speaker.is_paused(owner)})
         elif path == "/shutdown":
             self._send(200, {"shutdown": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()

@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from claudevoice import server as server_module
 from claudevoice.server import MAX_BODY_BYTES, MAX_RECORD_BYTES, SpeakerServer
 from claudevoice.spoken import SpokenLog
 from tests.fakes import make_speaker
@@ -184,6 +185,27 @@ def test_stop_with_a_bad_job_is_refused(running, job):
     assert call(server, "POST", "/stop", {"job": job})[0] == 400
 
 
+def test_pause_and_resume_take_an_owner(running, monkeypatch):
+    monkeypatch.setattr(server_module, "WAIT_HOLD_SECONDS", 0.2)
+    server, players = running
+    job = call(server, "POST", "/speak", {"text": "Hi.", "owner": "a"})[1]["job"]
+    assert players.playing()
+    assert call(server, "POST", "/pause", {"owner": "a"}) == (200, {"paused": True})
+    assert call(server, "GET", "/health")[1]["speaking"] is False
+    assert call(server, "GET", f"/wait?job={job}")[1] == {"job": job, "result": "waiting"}
+    assert call(server, "POST", "/resume", {"owner": "a"}) == (200, {"paused": False})
+    assert players.playing(2)
+    players.made[1].close()
+    assert call(server, "GET", f"/wait?job={job}")[1]["result"] == "finished"
+
+
+@pytest.mark.parametrize("path", ["/pause", "/resume"])
+@pytest.mark.parametrize("body", [{}, {"owner": ""}, {"owner": 5}])
+def test_pause_and_resume_without_an_owner_are_refused(running, path, body):
+    server, _ = running
+    assert call(server, "POST", path, body)[0] == 400
+
+
 @pytest.fixture
 def logged(tmp_path):
     speaker, players, _ = make_speaker(spoken_log=SpokenLog(tmp_path))
@@ -242,3 +264,13 @@ def test_text_over_the_limit_is_refused_even_with_a_record(logged):
     assert call(server, "POST", "/speak", body) == (413, {"error": "text is too long"})
     assert players.made == []
     assert list(folder.iterdir()) == []
+
+
+def test_speak_takes_a_paused_flag(running):
+    server, players = running
+    assert call(server, "POST", "/speak", {"text": "Hi.", "owner": "a", "paused": "yes"})[0] == 400
+    job = call(server, "POST", "/speak", {"text": "Hi.", "owner": "a", "paused": True})[1]["job"]
+    assert call(server, "POST", "/resume", {"owner": "a"}) == (200, {"paused": False})
+    assert players.playing()
+    players.made[0].close()
+    assert call(server, "GET", f"/wait?job={job}")[1]["result"] == "finished"
