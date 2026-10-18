@@ -1,0 +1,12 @@
+{
+  "name": "ray-voice",
+  "owner": {
+    "name": "Ray"
+  },
+  "plugins": [
+    {
+      "name": "read-aloud",
+      "source": "./addon"
+    }
+  ]
+}
