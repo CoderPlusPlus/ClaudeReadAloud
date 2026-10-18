@@ -82,3 +82,24 @@ Kokoro's own grades for each voice are listed at https://huggingface.co/hexgrad/
 ```bash
 claude plugin test addon
 ```
+
+## License
+
+ClaudeVoice's own code is released under the MIT License; see `LICENSE`.
+
+## Credits and licenses
+
+ClaudeVoice does not include any of the projects below. The voice model files are downloaded separately during setup, and the libraries are installed from PyPI, each under its own license.
+
+| Project | Used for | License |
+|---|---|---|
+| [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) by hexgrad | The voice model and voices | Apache 2.0 |
+| [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) | Runs the Kokoro model on this PC | MIT |
+| [espeak-ng](https://github.com/espeak-ng/espeak-ng) (installed through espeakng-loader) | Turns words into the sounds Kokoro speaks | GPL 3.0 |
+| [phonemizer](https://github.com/bootphon/phonemizer) | Used by kokoro-onnx for pronunciation | GPL 3.0 or later |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | Runs the model on the processor | MIT |
+| [sounddevice](https://github.com/spatialaudio/python-sounddevice) | Plays the audio | MIT |
+| [markdown-it-py](https://github.com/executablebooks/markdown-it-py) | Reads replies' formatting so it is not spoken | MIT |
+| [NumPy](https://numpy.org) | Audio data | BSD 3-Clause |
+
+The full list of libraries and versions is in `requirements.txt`.
