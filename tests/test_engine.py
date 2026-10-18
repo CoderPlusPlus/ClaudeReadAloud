@@ -123,6 +123,15 @@ def test_old_jobs_are_forgotten(close_later):
     assert speaker.wait(jobs[-1])["result"] == "finished"
 
 
+def test_jobs_still_waiting_are_never_forgotten(close_later):
+    speaker, players, _ = make_speaker(holds=True)
+    close_later(speaker)
+    jobs = [speaker.speak("Hi.", owner="a", queue=True) for _ in range(20)]
+    assert players.playing()
+    speaker.stop()
+    assert [speaker.wait(job)["result"] for job in jobs] == ["stopped"] * 20
+
+
 def test_simultaneous_requests_leave_nothing_playing_after_stop(close_later):
     from concurrent.futures import ThreadPoolExecutor
 

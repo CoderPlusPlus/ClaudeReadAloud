@@ -9,6 +9,7 @@ const BAND = {
 const TURN = { durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as const
 const ATTACH = { surface: 'desktop', clientId: 'desktop:default' } as const
 const START = { cwd: 'C:\\work\\MyProject', surface: 'desktop', isInteractive: true } as const
+const COLD_START_MS = 60_000
 const STATUS_WAITING = 'Will speak when you open this session'
 const ANNOUNCEMENT = 'MyProject has finished and would like to speak.'
 const ANNOUNCER = 'session-1#announce'
@@ -311,7 +312,7 @@ async function runTurn($: Engine, speaker: Speaker, answers: string[], turnId = 
 }
 
 describe('bar row', () => {
-  test('shows a voice toggle, picker, Repeat and Skip on desktop and terminal under what is drawn beneath', async ($, on) => {
+  test('shows a voice toggle, picker, Repeat and Skip on desktop and terminal under what is drawn beneath', { timeoutMs: COLD_START_MS }, async ($, on) => {
     emptyBand(on)
     for (const surface of ['desktop', 'terminal'] as const) {
       const ui = await open($, surface)
@@ -326,7 +327,7 @@ describe('bar row', () => {
     }
   })
 
-  test('draws nothing of its own while a survey is showing', async ($, on) => {
+  test('draws nothing of its own while a survey is showing', { timeoutMs: COLD_START_MS }, async ($, on) => {
     emptyBand(on)
     const ui = await $.ui.mount({ plugin: 'read-aloud', surface: 'desktop', ...BAND, props: { ...BAND.props, hasSurvey: true } })
     expect(await ui.find({ key: 'voice-toggle' })).toBeUndefined()

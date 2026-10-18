@@ -108,7 +108,7 @@ class _Playing:
 
 
 class Speaker:
-    """Speaks one text at a time. A new text cuts off everything playing or waiting, unless it is queued to follow them."""
+    """Speaks one text at a time. A new text cuts off everything playing or waiting, unless it is queued to follow them or, with after_own, only waits for its own owner's speech."""
 
     def __init__(
         self,
@@ -153,8 +153,8 @@ class Speaker:
         with self._lock:
             job = next(self._ids)
             self._jobs[job] = done
-            while len(self._jobs) > _KEPT_JOBS:
-                self._jobs.popitem(last=False)
+            for old in [j for j, f in self._jobs.items() if f.done()][: max(0, len(self._jobs) - _KEPT_JOBS)]:
+                del self._jobs[old]
         log.info("job %d: %d characters to speak with %s", job, len(spoken), voice)
         asyncio.run_coroutine_threadsafe(
             self._start(job, spoken, voice, owner, queue, after_own, done), self._loop

@@ -279,7 +279,7 @@ function retireAnnouncement(owner: string) {
   return ticket
 }
 
-// replace: cut off everything. queue: wait for everything. afterOwn: cut off other owners, wait for this owner's own speech.
+// replace: cut off everything. queue: stop this owner's own speech, then wait for everything else. afterOwn: cut off other owners, wait for this owner's own speech.
 type SendMode = 'replace' | 'queue' | 'afterOwn'
 
 // Announcements play under their own owner so a session's replies can cut them off without cutting off each other.
