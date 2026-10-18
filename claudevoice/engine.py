@@ -6,13 +6,15 @@ import re
 import threading
 from collections import OrderedDict, deque
 from collections.abc import Iterable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, AsyncIterator, Callable, Protocol
 
 import numpy as np
 
 from .config import Config, language_of
+from .spoken import SpokenLog, now, stamp
 from .text import to_speech
 
 SAMPLE_RATE = 24000
@@ -103,8 +105,13 @@ class SoundDevicePlayer:
 class _Playing:
     job: int
     owner: str
+    voice: str
+    spoken: str
+    record: dict | None
+    requested: datetime
+    played: datetime | None = None
     task: asyncio.Task | None = None
-    is_started: bool = False
+    settled: bool = False
 
 
 class Speaker:
@@ -116,8 +123,11 @@ class Speaker:
         config: Config,
         player_factory: Callable[[int], Player] = SoundDevicePlayer,
         voices: Iterable[str] | None = None,
+        spoken_log: SpokenLog | None = None,
     ):
         self._synthesizer = synthesizer
+        self._spoken_log = spoken_log
+        self._log_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spoken-log")
         self._config = config
         self._player_factory = player_factory
         self._voices = None if voices is None else frozenset(voices)
@@ -138,7 +148,13 @@ class Speaker:
         return self._voices is None or voice in self._voices
 
     def speak(
-        self, markdown: str, voice: str | None = None, owner: str = "", queue: bool = False, after_own: bool = False
+        self,
+        markdown: str,
+        voice: str | None = None,
+        owner: str = "",
+        queue: bool = False,
+        after_own: bool = False,
+        record: dict | None = None,
     ) -> int:
         """Starts speaking. `queue` waits for everything already playing; `after_own` cuts off other owners but waits for the owner's own."""
         if queue and after_own:
@@ -148,6 +164,7 @@ class Speaker:
         voice = voice or self._config.voice
         if not self.knows_voice(voice):
             raise ValueError(f"unknown voice {voice!r}")
+        requested = now()
         spoken = to_speech(markdown)
         done: Future = Future()
         with self._lock:
@@ -156,9 +173,8 @@ class Speaker:
             for old in [j for j, f in self._jobs.items() if f.done()][: max(0, len(self._jobs) - _KEPT_JOBS)]:
                 del self._jobs[old]
         log.info("job %d: %d characters to speak with %s", job, len(spoken), voice)
-        asyncio.run_coroutine_threadsafe(
-            self._start(job, spoken, voice, owner, queue, after_own, done), self._loop
-        ).result()
+        playing = _Playing(job, owner, voice, spoken, record, requested)
+        asyncio.run_coroutine_threadsafe(self._start(playing, queue, after_own, done), self._loop).result()
         return job
 
     def stop(self, owner: str | None = None, job: int | None = None) -> None:
@@ -176,12 +192,13 @@ class Speaker:
         return done.result()
 
     def is_speaking(self) -> bool:
-        return any(playing.is_started and not playing.task.done() for playing in list(self._playing))
+        return any(playing.played is not None and not playing.task.done() for playing in list(self._playing))
 
     def close(self) -> None:
         self.stop()
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join()
+        self._log_writer.shutdown(wait=True)
 
     async def _cancel(self, owner: str | None = None, keep: str | None = None, job: int | None = None) -> None:
         targets = [
@@ -195,23 +212,20 @@ class Speaker:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    async def _start(
-        self, job: int, spoken: str, voice: str, owner: str, queue: bool, after_own: bool, done: Future
-    ) -> None:
+    async def _start(self, playing: _Playing, queue: bool, after_own: bool, done: Future) -> None:
         async with self._starting:
-            if not spoken:
-                done.set_result({"job": job, "result": "nothing"})
+            if not playing.spoken:
+                self._settle(playing, done, {"job": playing.job, "result": "nothing"})
                 return
             if after_own:
-                await self._cancel(keep=owner)
-                before = {p.task for p in self._playing if p.owner == owner}
+                await self._cancel(keep=playing.owner)
+                before = {p.task for p in self._playing if p.owner == playing.owner}
             elif queue:
                 before = {p.task for p in self._playing}
             else:
                 await self._cancel()
                 before = set()
-            playing = _Playing(job, owner)
-            playing.task = self._loop.create_task(self._run(job, spoken, voice, done, before, playing))
+            playing.task = self._loop.create_task(self._run(done, before, playing))
             task = playing.task
             self._playing.append(playing)
             task.add_done_callback(lambda _: self._ended(playing, done))
@@ -219,13 +233,44 @@ class Speaker:
     def _ended(self, playing: _Playing, done: Future) -> None:
         if playing in self._playing:
             self._playing.remove(playing)
-        _settle(done, {"job": playing.job, "result": "stopped"})
+        self._settle(playing, done, {"job": playing.job, "result": "stopped"})
 
-    async def _run(self, job: int, spoken: str, voice: str, done: Future, before: set, playing: _Playing) -> None:
+    def _settle(self, playing: _Playing, done: Future, result: dict) -> None:
+        if playing.settled:
+            return
+        playing.settled = True
+        if self._spoken_log is None:
+            done.set_result(result)
+            return
+        ended = now()
+        line = {
+            "start": stamp(playing.requested),
+            "played": None if playing.played is None else stamp(playing.played),
+            "end": stamp(ended),
+            **result,
+            "owner": playing.owner,
+            "voice": playing.voice,
+            "text": playing.spoken,
+            "record": playing.record,
+        }
+        try:
+            self._log_writer.submit(self._write_log, playing.job, line, ended).add_done_callback(lambda _: done.set_result(result))
+        except RuntimeError:
+            log.exception("job %d: could not add it to the spoken log", playing.job)
+            done.set_result(result)
+
+    def _write_log(self, job: int, line: dict, ended: datetime) -> None:
+        try:
+            self._spoken_log.write(line, ended)
+        except Exception:
+            log.exception("job %d: could not add it to the spoken log", job)
+
+    async def _run(self, done: Future, before: set, playing: _Playing) -> None:
+        job, spoken, voice = playing.job, playing.spoken, playing.voice
         try:
             if before:
                 await asyncio.wait(before)
-            playing.is_started = True
+            playing.played = now()
             player = self._player_factory(SAMPLE_RATE)
             try:
                 for piece, pause in pieces(spoken):
@@ -249,10 +294,10 @@ class Speaker:
             raise
         except Exception as error:
             log.exception("job %d: failed", job)
-            _settle(done, {"job": job, "result": "error", "error": str(error)})
+            self._settle(playing, done, {"job": job, "result": "error", "error": str(error)})
         else:
             log.info("job %d: finished", job)
-            _settle(done, {"job": job, "result": "finished"})
+            self._settle(playing, done, {"job": job, "result": "finished"})
 
 
 def tidy(audio: np.ndarray) -> np.ndarray:
@@ -299,7 +344,3 @@ def _sentences(line: str) -> list[str]:
     result.append(line[start:])
     return [sentence for sentence in result if sentence]
 
-
-def _settle(done: Future, result: dict) -> None:
-    if not done.done():
-        done.set_result(result)

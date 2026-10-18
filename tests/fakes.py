@@ -4,6 +4,7 @@ import numpy as np
 
 from claudevoice.config import Config
 from claudevoice.engine import Speaker
+from claudevoice.spoken import SpokenLog
 
 
 class FakeSynthesizer:
@@ -65,7 +66,7 @@ class Players:
         return self.made[count - 1].started_waiting.wait(5)
 
 
-def make_speaker(holds: bool = False, synthesizer: FakeSynthesizer | None = None):
+def make_speaker(holds: bool = False, synthesizer: FakeSynthesizer | None = None, spoken_log: SpokenLog | None = None):
     players = Players(holds)
     synthesizer = synthesizer or FakeSynthesizer()
-    return Speaker(synthesizer, Config(), players), players, synthesizer
+    return Speaker(synthesizer, Config(), players, spoken_log=spoken_log), players, synthesizer

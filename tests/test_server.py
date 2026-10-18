@@ -5,7 +5,8 @@ import threading
 
 import pytest
 
-from claudevoice.server import MAX_BODY_BYTES, SpeakerServer
+from claudevoice.server import MAX_BODY_BYTES, MAX_RECORD_BYTES, SpeakerServer
+from claudevoice.spoken import SpokenLog
 from tests.fakes import make_speaker
 
 
@@ -182,3 +183,62 @@ def test_stop_with_a_bad_job_is_refused(running, job):
     server, _ = running
     assert call(server, "POST", "/stop", {"job": job})[0] == 400
 
+
+@pytest.fixture
+def logged(tmp_path):
+    speaker, players, _ = make_speaker(spoken_log=SpokenLog(tmp_path))
+    server = SpeakerServer(0, speaker)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server, players, tmp_path
+    server.shutdown()
+    server.server_close()
+    speaker.close()
+
+
+def test_a_record_is_kept_as_sent_on_the_job_line(logged):
+    server, _, folder = logged
+    record = {"session": "s1", "kind": "catch-up", "original": [{"kind": "reply", "toolUseIds": ["toolu_9"]}]}
+    status, body = call(server, "POST", "/speak", {"text": "Hi.", "owner": "s1", "record": record})
+    assert status == 200
+    assert call(server, "GET", f"/wait?job={body['job']}")[1]["result"] == "finished"
+    status, body = call(server, "POST", "/speak", {"text": "Bye."})
+    assert call(server, "GET", f"/wait?job={body['job']}")[1]["result"] == "finished"
+    lines = [json.loads(line) for path in folder.glob("*.jsonl") for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [(line["text"], line["owner"], line["record"]) for line in lines] == [("Hi.", "s1", record), ("Bye.", "", None)]
+
+
+@pytest.mark.parametrize("record", [None, [], "reply", 5, True])
+def test_a_record_that_is_not_an_object_is_refused(logged, record):
+    server, players, folder = logged
+    assert call(server, "POST", "/speak", {"text": "Hi.", "record": record}) == (400, {"error": "record must be a JSON object"})
+    assert players.made == []
+    assert list(folder.iterdir()) == []
+
+
+def test_a_large_record_does_not_stop_the_speech(logged):
+    server, players, folder = logged
+    body = {"text": "Hi.", "record": {"original": "a" * (MAX_BODY_BYTES * 2)}}
+    status, reply = call(server, "POST", "/speak", body)
+    assert status == 200
+    assert call(server, "GET", f"/wait?job={reply['job']}")[1]["result"] == "finished"
+    lines = [json.loads(line) for path in folder.glob("*.jsonl") for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [line["record"] for line in lines] == [body["record"]]
+
+
+def test_a_record_too_large_to_keep_is_replaced_and_the_speech_goes_ahead(logged):
+    server, players, folder = logged
+    body = {"text": "Hi.", "record": {"original": "a" * MAX_RECORD_BYTES}}
+    status, reply = call(server, "POST", "/speak", body)
+    assert status == 200
+    assert call(server, "GET", f"/wait?job={reply['job']}")[1]["result"] == "finished"
+    lines = [json.loads(line) for path in folder.glob("*.jsonl") for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [line["record"] for line in lines] == [{"omitted": "the record was too large to keep"}]
+
+
+def test_text_over_the_limit_is_refused_even_with_a_record(logged):
+    server, players, folder = logged
+    body = {"text": "a" * (MAX_BODY_BYTES + 1), "record": {"session": "s1"}}
+    assert call(server, "POST", "/speak", body) == (413, {"error": "text is too long"})
+    assert players.made == []
+    assert list(folder.iterdir()) == []

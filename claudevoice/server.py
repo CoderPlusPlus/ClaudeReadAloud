@@ -10,6 +10,7 @@ from .config import SERVICE_NAME
 from .engine import Speaker
 
 MAX_BODY_BYTES = 2_000_000
+MAX_RECORD_BYTES = 8_000_000
 MAX_DRAIN_BYTES = 64_000_000
 LOAD_WAIT_SECONDS = 120
 _HUGE = 10**18
@@ -78,13 +79,13 @@ class _Handler(BaseHTTPRequestHandler):
                 break
             remaining -= len(chunk)
 
-    def _read_json(self) -> dict | None:
+    def _read_json(self, limit: int = MAX_BODY_BYTES) -> dict | None:
         length = _whole_number(self.headers.get("Content-Length") or "0")
         if length is None:
             self._send(400, {"error": "Content-Length must be a number"})
             return None
         self._unread = length
-        if length > MAX_BODY_BYTES:
+        if length > limit:
             self._send(413, {"error": "text is too long"})
             return None
         self._unread = 0
@@ -138,7 +139,7 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/speak" and speaker is None:
             self._send(503, {"error": "the voice is still loading"})
         elif path == "/speak":
-            body = self._read_json()
+            body = self._read_json(MAX_BODY_BYTES + MAX_RECORD_BYTES)
             if body is None:
                 return
             text = body.get("text")
@@ -146,16 +147,24 @@ class _Handler(BaseHTTPRequestHandler):
             owner = body.get("owner", "")
             queue = body.get("queue", False)
             after_own = body.get("after_own", False)
+            record = body.get("record")
             if not isinstance(text, str):
                 self._send(400, {"error": "text must be a string"})
+            elif len(text.encode("utf-8")) > MAX_BODY_BYTES:
+                self._send(413, {"error": "text is too long"})
             elif voice is not None and (not isinstance(voice, str) or not speaker.knows_voice(voice)):
                 self._send(400, {"error": f"unknown voice {voice!r}"})
             elif not isinstance(owner, str) or not isinstance(queue, bool) or not isinstance(after_own, bool):
                 self._send(400, {"error": "owner must be a string, and queue and after_own true or false"})
             elif after_own and (queue or not owner):
                 self._send(400, {"error": "after_own needs an owner and cannot be combined with queue"})
+            elif "record" in body and not isinstance(record, dict):
+                self._send(400, {"error": "record must be a JSON object"})
             else:
-                self._send(200, {"job": speaker.speak(text, voice=voice, owner=owner, queue=queue, after_own=after_own)})
+                if isinstance(record, dict) and len(json.dumps(record).encode("utf-8")) > MAX_RECORD_BYTES:
+                    record = {"omitted": "the record was too large to keep"}
+                job = speaker.speak(text, voice=voice, owner=owner, queue=queue, after_own=after_own, record=record)
+                self._send(200, {"job": job})
         elif path == "/stop" and speaker is not None:
             body = self._read_json()
             if body is None:

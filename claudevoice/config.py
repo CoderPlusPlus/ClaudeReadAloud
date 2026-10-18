@@ -7,6 +7,7 @@ CONFIG_FILE = ROOT / "config.json"
 MODEL_FILE = ROOT / "models" / "kokoro-v1.0.onnx"
 VOICES_FILE = ROOT / "models" / "voices-v1.0.bin"
 LOG_FILE = ROOT / "logs" / "speaker.log"
+SPOKEN_FOLDER = ROOT / "logs" / "spoken"
 SERVICE_NAME = "claudevoice"
 
 # The first letter of a Kokoro voice name says its accent.

@@ -23,6 +23,8 @@ type Speaker = {
   starts: string[][]
   spoken: string[]
   sends: Sent[]
+  records: unknown[]
+  writes: string[]
   played: string[]
   ended: { text: string; result: string }[]
   playing: () => string | undefined
@@ -38,15 +40,20 @@ type Speaker = {
   urls: string[]
   exists: (path: string) => boolean
   summaryRequests: { model: string; system: string; prompt: string }[]
-  summaryMode: 'answer' | 'fail' | 'timeout'
+  summaryMode: 'answer' | 'fail' | 'timeout' | 'long'
   holdSummaries: number
   summaryFailure: Record<string, unknown>
   summaryCancelled: boolean
+  cancelledCount: number
+  surfaceGate?: Promise<void>
+  surfaceCalls: number
   releasers: (() => void)[]
   releaseSummaries: () => void
   surfaces: string[]
   answers: string[]
-  stepCount: number
+  thoughts: string[]
+  tools: string[][]
+  stepCounts: Map<string, number>
   cwd: string
   sessionId: string
   until: (condition: () => boolean) => Promise<void>
@@ -117,6 +124,8 @@ function fakeSpeaker(on: On): Speaker {
     starts: [],
     spoken: [],
     sends: [],
+    records: [],
+    writes: [],
     played: [],
     ended: [],
     playing: () => current?.text,
@@ -141,11 +150,15 @@ function fakeSpeaker(on: On): Speaker {
     holdSummaries: 0,
     summaryFailure: { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded' },
     summaryCancelled: false,
+    cancelledCount: 0,
+    surfaceCalls: 0,
     releasers: [],
     releaseSummaries: () => speaker.releasers.splice(0).forEach(release => release()),
     surfaces: ['desktop'],
     answers: [],
-    stepCount: 0,
+    thoughts: [],
+    tools: [],
+    stepCounts: new Map(),
     cwd: 'C:\\work\\MyProject',
     sessionId: 'session-1',
     settle: () => clock.settle(),
@@ -165,12 +178,27 @@ function fakeSpeaker(on: On): Speaker {
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('turn.step', async function* (_$, e) {
+    const thought = speaker.thoughts.shift() ?? ''
+    if (thought) {
+      yield { kind: 'thinking', index: 0, text: thought.slice(0, 3), ref: 1 } as never
+      yield { kind: 'thinking', index: 0, text: thought.slice(3), ref: 2 } as never
+    }
+    for (const [i, id] of (speaker.tools.shift() ?? []).entries()) yield { kind: 'tool', index: i + 2, id, name: 'Read', ref: i + 3 } as never
     return { turnId: e.turnId, index: e.index, answer: speaker.answers.shift() ?? '', toolUses: [], stopReason: 'end_turn', usage: null }
   })
   on('fs.exists', (_$, e) => ({ value: speaker.exists(e.path) }))
+  on('fs.write', (_$, e) => {
+    speaker.writes.push(e.path)
+    return { value: undefined }
+  })
   on('session.id', () => ({ value: speaker.sessionId }))
   on('session.cwd', () => ({ value: speaker.cwd }))
-  on('session.surfaces', () => ({ value: speaker.surfaces }))
+  on('session.surfaces', async () => {
+    speaker.surfaceCalls += 1
+    notify()
+    await speaker.surfaceGate
+    return { value: speaker.surfaces }
+  })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.attach', (_$, e) => ({ clientId: e.clientId }))
   on('classic.SessionStart', () => ({}))
@@ -182,8 +210,9 @@ function fakeSpeaker(on: On): Speaker {
     if (!speaker.isRunning) return { deny: 'connection refused' }
     if (url.pathname === '/health') return answer({ service: 'claudevoice', ready: true, speaking: current !== undefined })
     if (url.pathname === '/speak') {
-      const body = JSON.parse(e.init?.body ?? '{}') as Sent
+      const { record, ...body } = JSON.parse(e.init?.body ?? '{}') as Sent & { record?: unknown }
       speaker.sends.push(body)
+      speaker.records.push(record)
       speaker.spoken.push(body.text)
       const job = enqueue(body)
       if (speaker.holdSends > 0) {
@@ -226,13 +255,15 @@ function fakeSpeaker(on: On): Speaker {
       })
       if (cancelled) {
         speaker.summaryCancelled = true
+        speaker.cancelledCount += 1
         notify()
         return { value: { isAnswered: false, reason: 'aborted', usage: { input_tokens: 0, output_tokens: 0 } } }
       }
     }
     if (speaker.summaryMode === 'timeout') return { value: { isAnswered: false, reason: 'aborted' } }
     if (speaker.summaryMode === 'fail') return { value: speaker.summaryFailure }
-    const reply = prompt.replace(/^<reply>\n/, '').replace(/\n<\/reply>$/, '')
+    if (speaker.summaryMode === 'long') return { value: { isAnswered: true, text: 'Report. '.repeat(80), usage: { input_tokens: 1, output_tokens: 1 } } }
+    const reply = prompt.replace(/^<(reply|thinking)>\n/, '').replace(/\n<\/(reply|thinking)>$/, '')
     return { value: { isAnswered: true, text: `Spoken: ${reply}`, usage: { input_tokens: 1, output_tokens: 1 } } }
   })
 
@@ -289,9 +320,15 @@ async function turnVoiceOn(ui: Mounted) {
   expect((await ui.find({ key: 'voice-toggle' }))?.props.label).toBe('Voice: on')
 }
 
-async function step($: Engine, speaker: Speaker, answer: string, extra: { turnId?: string; agentId?: string } = {}) {
+async function step($: Engine, speaker: Speaker, answer: string, extra: { turnId?: string; agentId?: string; thought?: string; tools?: string[] } = {}) {
+  const { thought = '', tools = [], ...rest } = extra
   speaker.answers.push(answer)
-  const stream = $.turn.step({ turnId: 't1', index: speaker.stepCount++, model: 'opus', messageCount: 1, ...extra })
+  speaker.thoughts.push(thought)
+  speaker.tools.push(tools)
+  const turnId = rest.turnId ?? 't1'
+  const index = speaker.stepCounts.get(turnId) ?? 0
+  speaker.stepCounts.set(turnId, index + 1)
+  const stream = $.turn.step({ model: 'opus', messageCount: 1, ...rest, turnId, index })
   let read = await stream.next()
   while (!read.done) read = await stream.next()
   return read.value
@@ -465,6 +502,18 @@ describe('with voice on and the session viewed', () => {
     await ui.unmount()
   })
 
+  test('Repeat sends thinking to Haiku labeled as thinking when the latest block was thinking', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await step($, speaker, '', { thought: 'Hmm, let me think.' })
+    await $.turn.complete({ ...TURN, answer: '' })
+    await ui.press({ key: 'voice-repeat' })
+    await speaker.until(() => speaker.sends.length === 1)
+    expect(speaker.summaryRequests.map(request => request.prompt)).toEqual(['<thinking>\nHmm, let me think.\n</thinking>'])
+    await ui.unmount()
+  })
+
   test('a subagent step and turn ending are ignored, and Repeat still says the main reply', async ($, on) => {
     const speaker = fakeSpeaker(on)
     speaker.isRunning = true
@@ -517,6 +566,24 @@ describe('with voice on and the session viewed', () => {
     await finishTurn($, speaker, 'Hello.')
     await speaker.until(() => speaker.spoken.length === 1)
     expect(speaker.starts).toHaveLength(0)
+    await ui.unmount()
+  })
+
+  test('starts the speaker again when it stopped while the summary was being made', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holdSummaries = 1
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'Hello.')
+    await speaker.until(() => speaker.summaryRequests.length === 1)
+    await speaker.settle()
+    speaker.isRunning = false
+    speaker.releaseSummaries()
+    await speaker.until(() => speaker.spoken.length === 1)
+    expect(speaker.starts).toHaveLength(1)
+    expect(speaker.spoken).toEqual(['Spoken: Hello.'])
+    expect(speaker.toasts).toEqual([])
     await ui.unmount()
   })
 
@@ -1721,5 +1788,394 @@ describe('version label', () => {
     await ui.redraw()
     expect(await ui.find({ text: 'read-aloud v9.8.7' })).toBeDefined()
     await ui.unmount()
+  })
+})
+
+describe('reply stripe', () => {
+  test('draws what the app draws for each reply beside a colored stripe, on desktop and terminal', async ($, on) => {
+    on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
+      const { Markdown } = $.ui.resolve(e)
+      return <Markdown text={e.props.text} />
+    })
+    for (const surface of ['desktop', 'terminal'] as const) {
+      const ui = await $.ui.mount({
+        plugin: 'read-aloud',
+        surface,
+        component: 'AssistantMessage',
+        props: { text: 'Hello **there**.', isFirstOfReply: true },
+      })
+      const drawn = JSON.stringify(await ui.drawn())
+      expect(drawn).toContain('"backgroundColor":"#1BA9C4"')
+      expect(drawn).toContain('"type":"Markdown"')
+      expect(drawn).toContain('Hello **there**.')
+      await ui.unmount()
+    }
+  })
+})
+
+describe('catching up on a session with many held blocks', () => {
+  test('more than three held blocks play as one catch-up made from all of them', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurns($, speaker, ['One?', 'Two.', 'Three.', 'Four.'])
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    await showsPlace(speaker, ui, 'Message 1 of 4')
+
+    speaker.holds = () => true
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.until(() => speaker.sends.length === 2)
+    const catchUp = speaker.summaryRequests[4]!
+    expect(catchUp.system).toContain('catches the person up')
+    expect(catchUp.system).toContain('a question that a later piece answers')
+    for (const [i, text] of ['One?', 'Two.', 'Three.', 'Four.'].entries()) expect(catchUp.prompt).toContain(`<reply ${i + 1}>\n${text}\n</reply>`)
+    expect(speaker.sends[1]).toEqual({ text: `Spoken: ${catchUp.prompt.replace(/\n<\/reply>$/, '')}`, voice: 'af_heart', owner: 'session-1', after_own: true })
+    await showsPlace(speaker, ui, 'Message 1 of 1')
+    speaker.end()
+    await showsPlace(speaker, ui, undefined)
+    await speaker.settle()
+    expect(speaker.sends).toHaveLength(2)
+    await ui.unmount()
+  })
+
+  test('a catch-up labels thinking blocks as thinking', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await step($, speaker, 'One.', { thought: 'Hmm.' })
+    await finishTurns($, speaker, ['Two.', 'Three.'])
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.until(() => speaker.summaryRequests.length === 5)
+    expect(speaker.summaryRequests[4]!.prompt).toContain('<thinking 1>\nHmm.\n</thinking>')
+    expect(speaker.summaryRequests[4]!.prompt).toContain('<reply 2>\nOne.\n</reply>')
+    await ui.unmount()
+  })
+
+  test('opening the session while the first block is still being summarized plays the catch-up for all blocks', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    speaker.holdSummaries = 1
+    await finishTurns($, speaker, ['One.', 'Two.', 'Three.', 'Four.'])
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await showsStatus(speaker, ui, 'Summarizing…')
+    speaker.releaseSummaries()
+    await speaker.until(() => speaker.sends.length === 2)
+    expect(speaker.sends[1]!.text).toContain('<reply 4>')
+    expect(speaker.records[1]).toMatchObject({ kind: 'catch-up', summary: 'haiku' })
+    expect(speaker.records[1]!.original).toHaveLength(4)
+    await ui.unmount()
+  })
+
+  test('another client attaching to a session already on screen does not combine its pending blocks', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = ['desktop']
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    speaker.holdSummaries = 1
+    await finishTurns($, speaker, ['One.', 'Two.', 'Three.', 'Four.'])
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    await speaker.settle()
+    await $.session.attach(ATTACH)
+    await speaker.settle()
+    expect(speaker.summaryRequests).toHaveLength(4)
+    speaker.releaseSummaries()
+    await speaker.until(() => speaker.sends.length === 4)
+    expect(speaker.records.map(record => record.kind)).toEqual(['reply', 'reply', 'reply', 'reply'])
+    await ui.unmount()
+  })
+
+  test('opening the session while a block waits to learn if it is viewed still plays the catch-up, and says so in the record', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    let release!: () => void
+    speaker.surfaceGate = new Promise<void>(resolve => (release = resolve))
+    for (const answer of ['One.', 'Two.', 'Three.', 'Four.']) await step($, speaker, answer)
+    await speaker.until(() => speaker.summaryRequests.length === 4 && speaker.surfaceCalls > 0)
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.until(() => speaker.summaryRequests.length === 5)
+    release()
+    await speaker.until(() => speaker.sends.length === 1)
+    await speaker.settle()
+    expect(speaker.sends).toHaveLength(1)
+    expect(speaker.sends[0]!.text).toContain('<reply 4>')
+    expect(speaker.records[0]).toMatchObject({ kind: 'catch-up', summary: 'haiku' })
+    expect(speaker.records[0]!.original).toHaveLength(4)
+    await ui.unmount()
+  })
+
+  test('stopping cancels the requests of blocks folded into a catch-up as well as the catch-up', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    speaker.holdSummaries = 5
+    for (const answer of ['One.', 'Two.', 'Three.', 'Four.']) await step($, speaker, answer)
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.until(() => speaker.summaryRequests.length === 5)
+    await ui.press({ key: 'voice-toggle' })
+    await speaker.settle()
+    expect(speaker.cancelledCount).toBe(5)
+    expect(speaker.sends).toHaveLength(0)
+    await ui.unmount()
+  })
+
+  test('the row says Summarizing while the catch-up is being made', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurns($, speaker, ['One.', 'Two.', 'Three.', 'Four.'])
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    speaker.holdSummaries = 1
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.until(() => speaker.summaryRequests.length === 5)
+    await showsStatus(speaker, ui, 'Summarizing…')
+    speaker.releaseSummaries()
+    await ui.unmount()
+  })
+
+  test('when the catch-up cannot be made, a message says so', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurns($, speaker, ['One.', 'Two.', 'Three.', 'Four.'])
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    speaker.summaryMode = 'fail'
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.until(() => speaker.sends.length === 2)
+    await speaker.until(() => speaker.toasts.length > 0)
+    expect(speaker.toasts[0]).toContain('Could not make a catch-up summary (Claude answered with code 529)')
+    await ui.unmount()
+  })
+
+  test('when the catch-up cannot be made, the separate summaries play back to back as one', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurns($, speaker, ['One.', 'Two.', 'Three.', 'Four.'])
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    speaker.summaryMode = 'fail'
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.settle()
+    await speaker.until(() => speaker.sends.length === 2)
+    expect(speaker.sends[1]!.text).toBe(['One.', 'Two.', 'Three.', 'Four.'].map(text => `Spoken: ${text}`).join('\n\n'))
+    await ui.unmount()
+  })
+})
+
+describe('a summary that runs away', () => {
+  test('a summary far longer than its block is replaced by the block itself', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    const block = 'A'.repeat(250) + '.'
+    speaker.summaryMode = 'long'
+    await finishTurn($, speaker, block)
+    await speaker.until(() => speaker.sends.length === 1)
+    expect(speaker.sends[0]!.text).toBe(block)
+    expect(speaker.summaryRequests[0]!.system).toContain('Write the script once, in the first person, with nothing before or after it')
+    await ui.unmount()
+  })
+})
+
+describe('point of view', () => {
+  test('the instructions make Haiku speak as the assistant, never about it', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'Hello.')
+    await speaker.until(() => speaker.summaryRequests.length === 1)
+    const rules = speaker.summaryRequests[0]!.system
+    expect(rules).toContain('You are the speaking voice of a coding assistant.')
+    expect(rules).toContain('Never call the assistant "the assistant", "the agent"')
+    await ui.unmount()
+  })
+})
+
+describe('reading thinking', () => {
+  test('a step with thinking and a reply queues the thinking first, then the reply', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await step($, speaker, 'The reply.', { thought: 'My thinking.' })
+    await speaker.until(() => speaker.sends.length === 2)
+    expect(speaker.sends.map(sent => sent.text)).toEqual(['Spoken: My thinking.', 'Spoken: The reply.'])
+    expect(speaker.summaryRequests[0]!.system).toContain("Sometimes you are given the assistant's thinking")
+    expect(speaker.summaryRequests[0]!.system).toContain('"Gradle 8.9" becomes "Gradle 8 point 9"')
+    await ui.unmount()
+  })
+
+  test('thinking is sent in thinking tags and a reply in reply tags', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await step($, speaker, 'The reply.', { thought: 'My thinking.' })
+    await speaker.until(() => speaker.summaryRequests.length === 2)
+    expect(speaker.summaryRequests.map(request => request.prompt)).toEqual([
+      '<thinking>\nMy thinking.\n</thinking>',
+      '<reply>\nThe reply.\n</reply>',
+    ])
+    expect(speaker.summaryRequests[0]!.system).toContain('<thinking> tags')
+    await ui.unmount()
+  })
+
+  test('a step with only thinking is still read', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await step($, speaker, '', { thought: 'Only thinking here.' })
+    await speaker.until(() => speaker.sends.length === 1)
+    expect(speaker.sends[0]!.text).toBe('Spoken: Only thinking here.')
+    await ui.unmount()
+  })
+
+  test('a subagent step does not read its thinking', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await step($, speaker, '', { thought: 'Subagent thinking.', agentId: 'helper' })
+    await speaker.settle()
+    expect(speaker.sends).toEqual([])
+    await ui.unmount()
+  })
+})
+
+describe('what is sent with each speech for the spoken log', () => {
+  const ABOUT = { session: 'session-1', sessionName: 'MyProject' }
+
+  test('thinking and reply blocks carry their turn, step, the tool call ids of that step, the original text and how it was made', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await $.turn.start({ turnId: 't1', text: 'Go' })
+    await step($, speaker, 'The reply.', { thought: 'My thinking.', tools: ['toolu_a', 'toolu_b'] })
+    await step($, speaker, 'Second reply.')
+    await speaker.until(() => speaker.records.length === 3)
+    expect(speaker.records).toEqual([
+      { ...ABOUT, kind: 'thinking', turnId: 't1', step: 0, toolUseIds: ['toolu_a', 'toolu_b'], original: 'My thinking.', summary: 'haiku' },
+      { ...ABOUT, kind: 'reply', turnId: 't1', step: 0, toolUseIds: ['toolu_a', 'toolu_b'], original: 'The reply.', summary: 'haiku' },
+      { ...ABOUT, kind: 'reply', turnId: 't1', step: 1, toolUseIds: [], original: 'Second reply.', summary: 'haiku' },
+    ])
+    await $.turn.complete({ ...TURN, answer: 'Second reply.' })
+    await speaker.settle()
+    expect(speaker.writes).toEqual([])
+    await ui.unmount()
+  })
+
+  test('a block read in full says why, and a runaway summary says it was replaced', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    speaker.summaryMode = 'fail'
+    await finishTurn($, speaker, 'Hello.')
+    await speaker.until(() => speaker.ended.length === 1)
+    speaker.summaryMode = 'long'
+    const block = 'A'.repeat(250) + '.'
+    await finishTurn($, speaker, block, 't2')
+    await speaker.until(() => speaker.records.length === 2)
+    expect(speaker.records).toEqual([
+      { ...ABOUT, kind: 'reply', turnId: 't1', step: 0, toolUseIds: [], original: 'Hello.', summary: 'full-text', reason: 'Claude answered with code 529' },
+      { ...ABOUT, kind: 'reply', turnId: 't2', step: 0, toolUseIds: [], original: block, summary: 'runaway' },
+    ])
+    await ui.unmount()
+  })
+
+  test('the announcement and Repeat say what they are', async ($, on) => {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurn($, speaker, 'One.')
+    await speaker.until(() => speaker.sends.length === 1)
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.until(() => speaker.ended.length === 2)
+    await showsNoStatus(speaker, ui)
+    await ui.press({ key: 'voice-repeat' })
+    await speaker.until(() => speaker.sends.length === 3)
+    expect(speaker.records).toEqual([
+      { ...ABOUT, kind: 'announcement' },
+      { ...ABOUT, kind: 'reply', turnId: 't1', step: 0, toolUseIds: [], original: 'One.', summary: 'haiku' },
+      { ...ABOUT, kind: 'repeat', original: 'One.', summary: 'saved' },
+    ])
+    await ui.unmount()
+  })
+
+  const HELD = [
+    { turnId: 't1', answer: 'One?', tools: [] },
+    { turnId: 't2', answer: 'Two.', tools: ['toolu_2'] },
+    { turnId: 't3', answer: 'Three.', tools: [] },
+    { turnId: 't4', answer: 'Four.', tools: ['toolu_4a', 'toolu_4b'] },
+  ]
+  const COMBINED = HELD.map(({ turnId, answer, tools }, i) => ({ kind: 'reply', turnId, step: 0, toolUseIds: tools, original: answer }))
+
+  async function catchUpRecord($: Engine, on: On, summaryMode: Speaker['summaryMode']) {
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.surfaces = []
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    for (const { turnId, answer, tools } of HELD) {
+      await step($, speaker, answer, { turnId, tools })
+      await $.turn.complete({ ...TURN, turnId, answer })
+    }
+    await speaker.until(() => speaker.summaryRequests.length === 4)
+    speaker.summaryMode = summaryMode
+    speaker.surfaces = ['desktop']
+    await $.session.attach(ATTACH)
+    await speaker.until(() => speaker.records.length === 2)
+    await ui.unmount()
+    return speaker.records[1]
+  }
+
+  test('a catch-up lists every block it was made from', async ($, on) => {
+    expect(await catchUpRecord($, on, 'answer')).toEqual({ ...ABOUT, kind: 'catch-up', original: COMBINED, summary: 'haiku' })
+  })
+
+  test('a catch-up that could not be made says the separate summaries were joined, and why', async ($, on) => {
+    expect(await catchUpRecord($, on, 'fail')).toEqual({
+      ...ABOUT,
+      kind: 'catch-up',
+      original: COMBINED,
+      summary: 'separate',
+      reason: 'Claude answered with code 529',
+    })
   })
 })

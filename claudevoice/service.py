@@ -13,6 +13,7 @@ from . import config as settings
 from .config import Config
 from .engine import Speaker
 from .server import LOAD_WAIT_SECONDS, SpeakerServer
+from .spoken import SpokenLog
 
 READY = "ready"
 RUNNING = "running"
@@ -90,7 +91,7 @@ def serve(config: Config) -> int:
             _signal(f"could not load the voice model: {error}")
             return 1
 
-        speaker = Speaker(kokoro, config, voices=kokoro.get_voices())
+        speaker = Speaker(kokoro, config, voices=kokoro.get_voices(), spoken_log=SpokenLog(settings.SPOKEN_FOLDER))
         try:
             if thread.is_alive():
                 server.set_speaker(speaker)
