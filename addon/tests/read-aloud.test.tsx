@@ -2245,6 +2245,31 @@ describe('pause and resume', () => {
     await ui.unmount()
   })
 
+  test('the row is not written again when its status and place have not changed', async ($, on) => {
+    let draws = 0
+    on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+      draws += 1
+      return next(e)
+    })
+    const speaker = fakeSpeaker(on)
+    speaker.isRunning = true
+    speaker.holds = () => true
+    const ui = await open($)
+    await turnVoiceOn(ui)
+    await finishTurns($, speaker, ['One.', 'Two.'])
+    await speaker.until(() => speaker.playing() === 'Spoken: One.')
+    await showsStatus(speaker, ui, 'Speaking')
+    await showsPlace(speaker, ui, 'Message 1 of 2')
+    const drawn = await ui.redraw().then(() => draws)
+    await $.session.attach(ATTACH)
+    await speaker.settle()
+    await ui.redraw()
+    expect(draws - drawn).toBeLessThanOrEqual(1)
+    speaker.end()
+    await showsPlace(speaker, ui, 'Message 2 of 2')
+    await ui.unmount()
+  })
+
   test('Pause is dimmed and does nothing while the session has nothing to say', async ($, on) => {
     const speaker = fakeSpeaker(on)
     speaker.isRunning = true

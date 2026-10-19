@@ -394,9 +394,13 @@ function placeOf(owner: string): Place | null {
   return { current: line.at + 1, total: line.entries.length }
 }
 
+// Every write redraws the row above the prompt, which also scrolls an open voice picker back to its value, so only changes are written.
 async function refresh($: EngineInterface, owner: string) {
-  await update($, status, () => statusOf(owner))
-  await update($, place, () => placeOf(owner))
+  const nextStatus = statusOf(owner)
+  if ((await read($, status)) !== nextStatus) await update($, status, () => nextStatus)
+  const nextPlace = placeOf(owner)
+  const shown = await read($, place)
+  if (shown?.current !== nextPlace?.current || shown?.total !== nextPlace?.total) await update($, place, () => nextPlace)
 }
 
 function makeEntry($: EngineInterface, text: string, mode: SendMode, kind: Entry['kind'], blocks: Block[], heard: 'reply' | 'thinking'): Entry {

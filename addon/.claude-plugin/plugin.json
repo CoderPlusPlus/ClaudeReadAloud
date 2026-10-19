@@ -1,1 +1,1 @@
-{ "name": "read-aloud", "version": "0.1.22", "description": "Reads a short spoken version of each block of Claude's reply and thinking aloud as it arrives, with a local Kokoro voice", "author": { "name": "Ray" }, "types": "./types/index.d.ts" }
+{ "name": "read-aloud", "version": "0.1.25", "description": "Reads a short spoken version of each block of Claude's reply and thinking aloud as it arrives, with a local Kokoro voice", "author": { "name": "Ray" }, "types": "./types/index.d.ts" }

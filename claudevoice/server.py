@@ -13,8 +13,8 @@ MAX_BODY_BYTES = 2_000_000
 MAX_RECORD_BYTES = 8_000_000
 MAX_DRAIN_BYTES = 64_000_000
 LOAD_WAIT_SECONDS = 120
-# Kept under the time a client is likely to give up on one request; a paused job can wait far longer, so clients ask again.
-WAIT_HOLD_SECONDS = 30
+# Well under the 30 seconds the Claude app waits for one add-on request; a paused job can wait far longer, so clients ask again.
+WAIT_HOLD_SECONDS = 20
 _HUGE = 10**18
 
 log = logging.getLogger(__name__)
